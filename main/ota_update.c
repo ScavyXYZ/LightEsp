@@ -9,15 +9,20 @@
 #include "esp_http_client.h"
 #include "esp_https_ota.h"
 #include "esp_ota_ops.h"
+#include "esp_crt_bundle.h"
 #include "cJSON.h"
 
 static const char *TAG = "ota_update";
 
-/* Embedded at build time from certs/github_root_ca.pem (see CMakeLists.txt).
- * Covers api.github.com, github.com and objects.githubusercontent.com,
- * which are all issued under the same public CA chain. */
-extern const uint8_t github_root_ca_pem_start[] asm("_binary_github_root_ca_pem_start");
-extern const uint8_t github_root_ca_pem_end[]   asm("_binary_github_root_ca_pem_end");
+/* We use ESP-IDF's built-in certificate bundle (esp_crt_bundle) instead of a
+ * single hand-embedded root CA PEM. It ships a curated set of public root
+ * CAs (the same trust set curl/Mozilla use) compiled into the firmware, and
+ * esp_http_client / esp_https_ota pick the right one automatically for
+ * whatever host they connect to (api.github.com, and the
+ * objects.githubusercontent.com host that release asset downloads redirect
+ * to). This avoids maintaining/copy-pasting a raw PEM file by hand, which is
+ * error-prone. Requires CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y (default on in
+ * recent ESP-IDF; see OTA_SETUP.md). */
 
 #define OTA_AUTO_CHECK_INTERVAL_MS (24ULL * 60 * 60 * 1000) /* once a day */
 #define OTA_HTTP_TIMEOUT_MS        15000
@@ -75,9 +80,8 @@ static esp_err_t fetch_release_manifest(char *out_version, size_t out_version_si
         .url = "https://api.github.com/repos/" OTA_GITHUB_OWNER "/" OTA_GITHUB_REPO "/releases/latest",
         .event_handler = http_event_handler,
         .user_data = &buf,
-        .cert_pem = (const char *)github_root_ca_pem_start,
+        .crt_bundle_attach = esp_crt_bundle_attach,
         .timeout_ms = OTA_HTTP_TIMEOUT_MS,
-        .crt_bundle_attach = NULL,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&config);
@@ -179,13 +183,18 @@ static bool remote_version_is_newer(const char *current, const char *remote) {
 static esp_err_t perform_ota_flash(const char *firmware_url) {
     esp_http_client_config_t http_config = {
         .url = firmware_url,
-        .cert_pem = (const char *)github_root_ca_pem_start,
+        .crt_bundle_attach = esp_crt_bundle_attach,
         .timeout_ms = OTA_HTTP_TIMEOUT_MS,
         .keep_alive_enable = true,
-        /* objects.githubusercontent.com is where GitHub redirects asset
-         * downloads to; esp_https_ota follows redirects by default but
-         * needs the same CA to trust the redirected host too. Both hosts
-         * chain to the same public root, so one cert_pem covers both. */
+        /* GitHub's release download redirects (github.com ->
+         * objects.githubusercontent.com) carry a long signed Location
+         * header (often 1-2KB with the access token/query params), which
+         * overflows esp_http_client's default header buffer and fails
+         * with "Out of buffer" before the redirect can even be followed.
+         * Bump both buffers well past that; a few KB is cheap against the
+         * heap headroom this task already has (8KB stack via task create). */
+        .buffer_size = 4096,
+        .buffer_size_tx = 2048,
     };
 
     esp_https_ota_config_t ota_config = {
