@@ -5,7 +5,7 @@
 
 /* Bump this with every release. Must exactly match the "tag_name" of the
  * GitHub release you publish (e.g. tag "v1.0.3" -> FIRMWARE_VERSION "v1.0.3"). */
-#define FIRMWARE_VERSION "v1.0.2"
+#define FIRMWARE_VERSION "v1.0.3"
 
 /* GitHub repo that hosts releases (owner/repo, no scheme). */
 #define OTA_GITHUB_OWNER "ScavyXYZ"
@@ -39,3 +39,11 @@ bool ota_is_busy(void);
 /* Latest version string seen on GitHub during the last check (may be
  * empty if no check has completed yet). Thread-safe snapshot copy. */
 void ota_get_latest_known_version(char *out, size_t out_size);
+
+/* Confirms the currently running app image is good, cancelling any
+ * pending bootloader rollback. Safe no-op if app rollback isn't enabled
+ * in sdkconfig. Call once, early, after the app has come up cleanly
+ * (e.g. right after Wi-Fi connects and the web server starts) -- ideally
+ * before ota_start_auto_check_task(), so a freshly-flashed image is
+ * confirmed before it might attempt another OTA. */
+void ota_confirm_running_app(void);

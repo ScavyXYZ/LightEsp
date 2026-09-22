@@ -26,7 +26,14 @@ static const char *TAG = "ota_update";
 
 #define OTA_AUTO_CHECK_INTERVAL_MS (24ULL * 60 * 60 * 1000) /* once a day */
 #define OTA_HTTP_TIMEOUT_MS        15000
-#define OTA_MANIFEST_BUF_SIZE      4096
+/* GitHub's releases/latest JSON includes a full record (multiple long
+ * URLs, uploader info, timestamps) for every asset attached to the
+ * release, not just the firmware .bin. A release with just a few extra
+ * assets (source archives, checksums, etc.) can easily exceed 4-6KB;
+ * 4096 was routinely truncating real releases and silently failing the
+ * update check every single time. 16KB comfortably covers a release with
+ * a handful of assets while still bounding worst-case heap usage. */
+#define OTA_MANIFEST_BUF_SIZE      16384
 #define OTA_MAX_VERSION_LEN        32
 #define OTA_MAX_URL_LEN            512
 
@@ -45,7 +52,12 @@ static esp_err_t dyn_buf_append(dyn_buf_t *b, const char *chunk, size_t chunk_le
     if (b->len + chunk_len + 1 > b->cap) {
         size_t new_cap = b->cap == 0 ? 1024 : b->cap;
         while (new_cap < b->len + chunk_len + 1) new_cap *= 2;
-        if (new_cap > OTA_MANIFEST_BUF_SIZE) return ESP_ERR_NO_MEM; /* manifest JSON should never be this big */
+        if (new_cap > OTA_MANIFEST_BUF_SIZE) {
+            ESP_LOGW("ota_update", "Manifest JSON exceeded %d bytes (need >=%u); "
+                     "raise OTA_MANIFEST_BUF_SIZE or trim release assets",
+                     OTA_MANIFEST_BUF_SIZE, (unsigned)(b->len + chunk_len + 1));
+            return ESP_ERR_NO_MEM;
+        }
         char *new_data = realloc(b->data, new_cap);
         if (!new_data) return ESP_ERR_NO_MEM;
         b->data = new_data;
@@ -170,8 +182,14 @@ static bool remote_version_is_newer(const char *current, const char *remote) {
     const char *r = remote;
     if (*r == 'v' || *r == 'V') r++;
 
-    if (sscanf(c, "%u.%u.%u", &cur[0], &cur[1], &cur[2]) < 1) return false;
-    if (sscanf(r, "%u.%u.%u", &rem[0], &rem[1], &rem[2]) < 1) return false;
+    if (sscanf(c, "%u.%u.%u", &cur[0], &cur[1], &cur[2]) < 1) {
+        ESP_LOGW(TAG, "Could not parse current version '%s' as semver, treating as not-newer", current);
+        return false;
+    }
+    if (sscanf(r, "%u.%u.%u", &rem[0], &rem[1], &rem[2]) < 1) {
+        ESP_LOGW(TAG, "Could not parse remote tag '%s' as semver, treating as not-newer", remote);
+        return false;
+    }
 
     for (int i = 0; i < 3; i++) {
         if (rem[i] > cur[i]) return true;
@@ -309,4 +327,25 @@ void ota_start_auto_check_task(void) {
         ota_mutex = xSemaphoreCreateMutex();
     }
     xTaskCreate(ota_auto_check_task, "ota_auto_check", 8192, NULL, 3, NULL);
+}
+
+void ota_confirm_running_app(void) {
+    /* If CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE is on, a freshly-flashed OTA
+     * image boots in "pending verify" state and the bootloader will revert
+     * to the previous firmware on the *next* reboot unless something in the
+     * new image explicitly confirms it's good. This call is the standard
+     * ESP-IDF confirmation; it's a harmless no-op if rollback support isn't
+     * enabled, so it's always safe to call once, early, after we know the
+     * app has come up cleanly (e.g. once Wi-Fi/web server are up). */
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t state;
+    if (running && esp_ota_get_state_partition(running, &state) == ESP_OK &&
+        state == ESP_OTA_IMG_PENDING_VERIFY) {
+        esp_err_t err = esp_ota_mark_app_valid_cancel_rollback();
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "Marked running app as valid, cancelled pending rollback");
+        } else {
+            ESP_LOGW(TAG, "Failed to confirm running app: %s", esp_err_to_name(err));
+        }
+    }
 }

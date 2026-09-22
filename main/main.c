@@ -574,7 +574,20 @@ static esp_err_t save_credentials_handler(httpd_req_t *req) {
     int total_received = 0;
     int remaining = req->content_len;
 
+    /* Bound the whole read by wall-clock time, not just per-call timeouts.
+     * A client that opens the connection, sends Content-Length, and then
+     * stalls (slow-loris style, or just a flaky network) would otherwise
+     * keep this HTTP worker task busy in an unbounded retry loop on
+     * HTTPD_SOCK_ERR_TIMEOUT, tying up one of the server's limited worker
+     * slots indefinitely. */
+    const TickType_t recv_deadline = xTaskGetTickCount() + pdMS_TO_TICKS(8000);
+
     while (remaining > 0) {
+        if (xTaskGetTickCount() >= recv_deadline) {
+            ESP_LOGW(TAG, "Timed out reading /save request body");
+            httpd_resp_send_err(req, HTTPD_408_REQ_TIMEOUT, "Request body read timed out");
+            return ESP_FAIL;
+        }
         int ret = httpd_req_recv(req, buf + total_received, remaining);
         if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
             continue;
@@ -1085,6 +1098,14 @@ void app_main(void) {
             start_mdns_service();
             start_web_server();
             xTaskCreate(httpd_health_check_task, "httpd_health", 2048, NULL, 3, NULL);
+            /* We've now proven Wi-Fi connects and the web server comes up
+             * on this image -- confirm it so the bootloader doesn't roll
+             * back to the previous firmware on the next reboot (only
+             * matters if app rollback is enabled in sdkconfig; harmless
+             * no-op otherwise). Do this before starting the auto-update
+             * task so a freshly-flashed image is confirmed before it
+             * might attempt yet another OTA. */
+            ota_confirm_running_app();
             ota_start_auto_check_task();
             return;
         }
