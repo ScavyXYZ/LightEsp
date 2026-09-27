@@ -2,10 +2,11 @@
 
 #include "esp_err.h"
 #include <stdbool.h>
+#include <stddef.h>
 
 /* Bump this with every release. Must exactly match the "tag_name" of the
  * GitHub release you publish (e.g. tag "v1.0.3" -> FIRMWARE_VERSION "v1.0.3"). */
-#define FIRMWARE_VERSION "v1.0.3"
+#define FIRMWARE_VERSION "v1.0.6"
 
 /* GitHub repo that hosts releases (owner/repo, no scheme). */
 #define OTA_GITHUB_OWNER "ScavyXYZ"

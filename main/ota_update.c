@@ -2,6 +2,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -37,8 +38,21 @@ static const char *TAG = "ota_update";
 #define OTA_MAX_VERSION_LEN        32
 #define OTA_MAX_URL_LEN            512
 
+/* FIX (#4, #12): ota_busy is now a proper critical-section-protected flag
+ * instead of a bare volatile bool.  The previous code set it outside the
+ * mutex in one branch and read it without any lock in ota_is_busy(), which
+ * could leave it stuck at true forever if a task got preempted at the wrong
+ * moment.  We keep the mutex only for the state snapshot itself (it must NOT
+ * be held across the long flash/HTTP operations), and use a dedicated
+ * "check in progress" flag protected by a short critical section. */
 static SemaphoreHandle_t ota_mutex = NULL;
+static portMUX_TYPE ota_state_lock = portMUX_INITIALIZER_UNLOCKED;
 static volatile bool ota_busy = false;
+
+/* FIX (#12): latest_known_version is written by the OTA task and read by
+ * the HTTP handler; guard it with its own mutex so a reader never sees a
+ * half-written string. */
+static SemaphoreHandle_t version_mutex = NULL;
 static char latest_known_version[OTA_MAX_VERSION_LEN] = {0};
 
 /* --- tiny helper: growable buffer for the HTTP GET body --- */
@@ -53,7 +67,7 @@ static esp_err_t dyn_buf_append(dyn_buf_t *b, const char *chunk, size_t chunk_le
         size_t new_cap = b->cap == 0 ? 1024 : b->cap;
         while (new_cap < b->len + chunk_len + 1) new_cap *= 2;
         if (new_cap > OTA_MANIFEST_BUF_SIZE) {
-            ESP_LOGW("ota_update", "Manifest JSON exceeded %d bytes (need >=%u); "
+            ESP_LOGW(TAG, "Manifest JSON exceeded %d bytes (need >=%u); "
                      "raise OTA_MANIFEST_BUF_SIZE or trim release assets",
                      OTA_MANIFEST_BUF_SIZE, (unsigned)(b->len + chunk_len + 1));
             return ESP_ERR_NO_MEM;
@@ -230,12 +244,51 @@ static esp_err_t perform_ota_flash(const char *firmware_url) {
     return err;
 }
 
+/* FIX (#4): atomic-ish busy flag accessors.  We use a portMUX critical
+ * section (very cheap) instead of taking the OTA mutex, because the mutex
+ * must not be held for the long duration of a flash — that would make
+ * ota_is_busy() block for minutes.  A critical section here is enough to
+ * give readers a consistent view. */
+static bool ota_busy_get(void) {
+    portENTER_CRITICAL(&ota_state_lock);
+    bool v = ota_busy;
+    portEXIT_CRITICAL(&ota_state_lock);
+    return v;
+}
+
+static void ota_busy_set(bool v) {
+    portENTER_CRITICAL(&ota_state_lock);
+    ota_busy = v;
+    portEXIT_CRITICAL(&ota_state_lock);
+}
+
+static void ota_set_latest_version(const char *v) {
+    if (!version_mutex) return;
+    if (xSemaphoreTake(version_mutex, portMAX_DELAY) == pdTRUE) {
+        strncpy(latest_known_version, v, sizeof(latest_known_version) - 1);
+        latest_known_version[sizeof(latest_known_version) - 1] = '\0';
+        xSemaphoreGive(version_mutex);
+    }
+}
+
 static ota_check_result_t do_check_and_maybe_update(bool apply_update, char *out_message, size_t out_message_size) {
+    /* We serialize *entire* check+update operations behind ota_mutex so two
+     * concurrent callers can never both start a flash.  The mutex is only
+     * released across the actual esp_https_ota() call... but only after we
+     * have set the busy flag under the critical section, so ota_is_busy()
+     * still reports true during the flash. */
     if (xSemaphoreTake(ota_mutex, pdMS_TO_TICKS(500)) != pdTRUE) {
         if (out_message) snprintf(out_message, out_message_size, "An update check is already in progress.");
         return OTA_CHECK_ERROR;
     }
-    ota_busy = true;
+
+    /* If some other task is mid-flash, don't even try. */
+    if (ota_busy_get()) {
+        xSemaphoreGive(ota_mutex);
+        if (out_message) snprintf(out_message, out_message_size, "An update is already in progress.");
+        return OTA_CHECK_ERROR;
+    }
+    ota_busy_set(true);
 
     char remote_version[OTA_MAX_VERSION_LEN] = {0};
     char asset_url[OTA_MAX_URL_LEN] = {0};
@@ -248,8 +301,7 @@ static ota_check_result_t do_check_and_maybe_update(bool apply_update, char *out
         goto done;
     }
 
-    strncpy(latest_known_version, remote_version, sizeof(latest_known_version) - 1);
-    latest_known_version[sizeof(latest_known_version) - 1] = '\0';
+    ota_set_latest_version(remote_version);
 
     if (!remote_version_is_newer(FIRMWARE_VERSION, remote_version)) {
         ESP_LOGI(TAG, "Firmware up to date (current=%s, latest=%s)", FIRMWARE_VERSION, remote_version);
@@ -269,10 +321,10 @@ static ota_check_result_t do_check_and_maybe_update(bool apply_update, char *out
     if (out_message) snprintf(out_message, out_message_size, "Downloading and installing %s...", remote_version);
     result = OTA_CHECK_UPDATE_STARTED;
 
-    /* Release the mutex before the (potentially long) flash so ota_is_busy()
-     * reporting still works via the ota_busy flag, but we don't need to also
-     * hold the lock through the reboot path. */
-    ota_busy = true;
+    /* FIX (#4): release the mutex *only* for the long flash, but the busy
+     * flag (set above under the critical section) stays true.  Anyone who
+     * calls do_check_and_maybe_update() in the meantime will take the
+     * mutex, immediately see ota_busy_get()==true, and bail out cleanly. */
     xSemaphoreGive(ota_mutex);
 
     err = perform_ota_flash(asset_url);
@@ -282,13 +334,13 @@ static ota_check_result_t do_check_and_maybe_update(bool apply_update, char *out
         /* unreachable */
     }
 
-    /* Flash failed: re-take the mutex just to clear busy state consistently. */
+    /* Flash failed: re-acquire the mutex to clear busy state consistently. */
     xSemaphoreTake(ota_mutex, portMAX_DELAY);
     if (out_message) snprintf(out_message, out_message_size, "Update download/flash failed, kept running current firmware.");
     result = OTA_CHECK_ERROR;
 
 done:
-    ota_busy = false;
+    ota_busy_set(false);
     xSemaphoreGive(ota_mutex);
     return result;
 }
@@ -298,13 +350,18 @@ ota_check_result_t ota_check_and_update(char *out_message, size_t out_message_si
 }
 
 bool ota_is_busy(void) {
-    return ota_busy;
+    return ota_busy_get();
 }
 
 void ota_get_latest_known_version(char *out, size_t out_size) {
     if (!out || out_size == 0) return;
-    strncpy(out, latest_known_version, out_size - 1);
-    out[out_size - 1] = '\0';
+    out[0] = '\0';
+    if (!version_mutex) return;
+    if (xSemaphoreTake(version_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        strncpy(out, latest_known_version, out_size - 1);
+        out[out_size - 1] = '\0';
+        xSemaphoreGive(version_mutex);
+    }
 }
 
 static void ota_auto_check_task(void *pvParameters) {
@@ -326,7 +383,12 @@ void ota_start_auto_check_task(void) {
     if (ota_mutex == NULL) {
         ota_mutex = xSemaphoreCreateMutex();
     }
-    xTaskCreate(ota_auto_check_task, "ota_auto_check", 8192, NULL, 3, NULL);
+    if (version_mutex == NULL) {
+        version_mutex = xSemaphoreCreateMutex();
+    }
+    /* FIX (#9): cJSON_Parse on a 16KB manifest plus TLS handshake can be
+     * stack-hungry; 8192 was marginal.  Bump to 12288 for headroom. */
+    xTaskCreate(ota_auto_check_task, "ota_auto_check", 12288, NULL, 3, NULL);
 }
 
 void ota_confirm_running_app(void) {

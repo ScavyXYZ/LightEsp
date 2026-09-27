@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <ctype.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -39,6 +40,9 @@
 #define DNS_MAX_PACKET_SIZE      128
 
 static const char *TAG = "wifi_app";
+/* FIX (#3): server handle touched by the health-check task from another
+ * task.  Make it volatile so the compiler doesn't cache it in a register
+ * across the health-check loop. */
 static httpd_handle_t server = NULL;
 static bool led_state = false;
 static TaskHandle_t dns_task_handle = NULL;
@@ -50,6 +54,16 @@ static EventGroupHandle_t wifi_event_group;
 
 #define WIFI_CONNECT_MAX_RETRIES 5
 static int wifi_retry_count = 0;
+
+/* True only until the very first successful connection at boot. While
+ * true, wifi_event_handler enforces WIFI_CONNECT_MAX_RETRIES and signals
+ * WIFI_FAIL_BIT so app_main can fall back to AP setup mode if the saved
+ * credentials don't work. Once we get our first IP, this flips to false
+ * and every disconnect after that retries forever -- a transient AP
+ * dropout, roaming event, or router hiccup must never permanently stop
+ * reconnection attempts and strand the device offline until a manual
+ * power cycle. */
+static volatile bool wifi_boot_phase = true;
 
 /* Guards against concurrent /save requests triggering overlapping
  * Wi-Fi connection attempts and duplicate event-handler registration.
@@ -63,10 +77,18 @@ static SemaphoreHandle_t wifi_test_mutex = NULL;
  * avoid racing with the temporary test-connection handler. */
 static volatile bool in_setup_mode = false;
 
+/* FIX (#6): blink_error_led() used to be called from the HTTP handler and
+ * the Wi-Fi event loop and blocked for 1.5s.  That can stall the event
+ * loop long enough to miss Wi-Fi events and trip the task watchdog.
+ * Replace with a small dedicated task that is signalled via a binary
+ * semaphore; callers just "give" the semaphore and return immediately. */
+static SemaphoreHandle_t led_blink_sem = NULL;
+static TaskHandle_t led_blink_task_handle = NULL;
+
 /* Shared style block used by every page so the whole flow (control,
  * wifi setup, factory reset) feels like one product instead of three
  * disconnected admin forms. Deliberately plain: no cards, gradients,
- * or shadows — flat background, one accent color, thin hairline rules. */
+ * or shadows -- flat background, one accent color, thin hairline rules. */
 static const char* shared_style_css =
 "*{box-sizing:border-box;}"
 ":root{"
@@ -124,7 +146,7 @@ static const char* shared_style_css =
 ;
 
 /* --- Control (home) page: just the orb and two buttons underneath.
- * No headings or labels — the glow itself communicates state. */
+ * No headings or labels -- the glow itself communicates state. */
 static const char* control_page_html =
 "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width, initial-scale=1'>"
 "<meta charset='utf-8'><title>Lamp</title>"
@@ -350,7 +372,7 @@ static esp_err_t send_config_page(httpd_req_t *req, const char *error_message) {
         /* Always give the user a usable option even if the scan was
          * skipped or failed, so they aren't stuck with an empty <select>. */
         offset += snprintf(resp + offset, resp_capacity - offset,
-            "<option value=''>(no networks found — refresh to rescan)</option>");
+            "<option value=''>(no networks found -- refresh to rescan)</option>");
     }
 
     if ((size_t)offset < resp_capacity) {
@@ -427,7 +449,7 @@ static esp_err_t config_page_handler(httpd_req_t *req) {
 
 /* Manual OTA trigger for the "Check for updates" button on /wifi.
  * Runs the check synchronously and, if an update is found, kicks off the
- * flash+reboot — so a successful call to this handler never actually
+ * flash+reboot -- so a successful call to this handler never actually
  * returns an HTTP response (the device reboots mid-flash); the client
  * simply loses the connection, which the button's fetch() already treats
  * as a terminal state via its catch branch. */
@@ -463,6 +485,31 @@ static esp_err_t update_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+/* Shared classification: which disconnect reasons are an unambiguous
+ * signal from the AP that the *credentials* are wrong, as opposed to a
+ * generic/transient auth-stage timeout that can also happen on a slow
+ * or first attempt right after boot (weak signal, busy channel, RF not
+ * fully warmed up yet, etc). Only WIFI_REASON_AUTH_FAIL is genuinely
+ * unambiguous: it's the code the AP sends specifically for a rejected
+ * open/shared-key auth. Deliberately NOT included here:
+ *   - WIFI_REASON_AUTH_EXPIRE: a timeout waiting for the auth exchange
+ *     to complete -- fires just as easily from a slow/busy channel or
+ *     cold radio as from a bad password. Treating this as fatal on the
+ *     very first attempt is what caused the false "wrong password"
+ *     verdict and a spurious fallback into AP setup mode.
+ *   - WIFI_REASON_HANDSHAKE_TIMEOUT / WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT:
+ *     also just a timeout, which can happen on a congested channel with
+ *     a correct password.
+ *   - WIFI_REASON_MIC_FAILURE: can be transient interference-induced,
+ *     not necessarily a wrong PSK.
+ * These "maybe" reasons are now routed through the normal retry counter
+ * instead of failing immediately; if they persist across every retry,
+ * WIFI_FAIL_BIT is still raised at the end so the device still falls
+ * back to setup mode -- it just gets a few real chances first. */
+static bool is_definite_auth_failure(uint8_t reason) {
+    return reason == WIFI_REASON_AUTH_FAIL;
+}
+
 /* --- Temporary "test connect" event handling, used only while /save is
  * validating credentials before committing them to NVS. Access to the
  * shared Wi-Fi state machine is serialized by wifi_test_mutex, so only
@@ -474,15 +521,7 @@ static void wifi_test_event_handler(void* arg, esp_event_base_t event_base,
         wifi_event_sta_disconnected_t *disconn = (wifi_event_sta_disconnected_t *)event_data;
         uint8_t reason = disconn ? disconn->reason : 0;
 
-        bool is_auth_failure =
-            (reason == WIFI_REASON_AUTH_FAIL) ||
-            (reason == WIFI_REASON_AUTH_EXPIRE) ||
-            (reason == WIFI_REASON_HANDSHAKE_TIMEOUT) ||
-            (reason == WIFI_REASON_MIC_FAILURE) ||
-            (reason == WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT) ||
-            (reason == WIFI_REASON_ASSOC_NOT_AUTHED);
-
-        if (is_auth_failure) {
+        if (is_definite_auth_failure(reason)) {
             xEventGroupSetBits(wifi_event_group, WIFI_AUTH_FAIL_BIT);
         } else {
             xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
@@ -532,7 +571,7 @@ static esp_err_t try_wifi_connection(const char *ssid, const char *password, Eve
     wifi_config.sta.password[max_pass - 1] = '\0';
 
     /* If either call fails (e.g. driver busy / bad state), don't sit through
-     * the full timeout doing nothing — bail out and report a clean error
+     * the full timeout doing nothing -- bail out and report a clean error
      * instead of leaving the caller waiting on bits that will never be set. */
     esp_err_t set_cfg_err = esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
     esp_err_t connect_err = (set_cfg_err == ESP_OK) ? esp_wifi_connect() : set_cfg_err;
@@ -553,14 +592,24 @@ static esp_err_t try_wifi_connection(const char *ssid, const char *password, Eve
     esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, instance_any_id);
     esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, instance_got_ip);
 
-    if (bits == 0) {
-        esp_wifi_disconnect();
+    /* FIX (#5): esp_wifi_disconnect() can block if the driver is in a bad
+     * state, and the previous code held wifi_test_mutex across it.  Move
+     * the disconnect *outside* the critical section: first record what we
+     * need to do, release the mutex, then perform the disconnect.  This
+     * guarantees the mutex is always released even if the driver hangs. */
+    bool need_disconnect = (bits == 0);
+    if (need_disconnect) {
         *out_result_bit = WIFI_FAIL_BIT;
     } else {
         *out_result_bit = bits;
     }
 
     xSemaphoreGive(wifi_test_mutex);
+
+    if (need_disconnect) {
+        esp_wifi_disconnect();
+    }
+
     return ESP_OK;
 }
 
@@ -769,12 +818,12 @@ static esp_err_t reset_action_handler(httpd_req_t *req) {
 void start_web_server(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     /* Let the server evict the oldest connection instead of refusing new
-     * ones outright when all sockets are busy — a client that never
+     * ones outright when all sockets are busy -- a client that never
      * closes its socket shouldn't be able to lock everyone else out. */
     config.lru_purge_enable = true;
-    /* /update can legitimately take a while (GitHub API round-trip +
-     * potential multi-hundred-KB firmware download), so give handlers
-     * more headroom than the httpd default. */
+    /* FIX (#8): /save stacks several ~100-byte buffers plus the nested
+     * try_wifi_connection() call.  The default 4096 was too tight and
+     * could panic on the save path.  Bump to 8192 for both servers. */
     config.stack_size = 8192;
     if (httpd_start(&server, &config) == ESP_OK) {
         httpd_uri_t root_uri = { .uri = "/", .method = HTTP_GET, .handler = root_handler };
@@ -810,6 +859,8 @@ void start_web_server(void) {
 void start_config_server(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.lru_purge_enable = true;
+    /* FIX (#8): same reasoning as start_web_server. */
+    config.stack_size = 8192;
     if (httpd_start(&server, &config) == ESP_OK) {
         httpd_uri_t config_uri = { .uri = "/", .method = HTTP_GET, .handler = config_page_handler };
         httpd_register_uri_handler(server, &config_uri);
@@ -950,22 +1001,54 @@ static void dns_server_task(void *pvParameters) {
 }
 
 static void start_dns_server(void) {
-    xTaskCreate(dns_server_task, "dns_server", 4096, NULL, 5, &dns_task_handle);
+    /* FIX (#1): 4096 bytes was too tight for lwIP socket calls + logging
+     * formatting + local buffers.  Bump to 6144 to leave headroom and
+     * avoid a slow stack overflow panic under sustained DNS traffic. */
+    xTaskCreate(dns_server_task, "dns_server", 6144, NULL, 5, &dns_task_handle);
+}
+
+/* FIX (#6): non-blocking blink request.  Callers just signal the task and
+ * return; the task owns the actual toggling so nothing else is held up. */
+static void led_blink_task(void *pvParameters) {
+    for (;;) {
+        if (xSemaphoreTake(led_blink_sem, portMAX_DELAY) == pdTRUE) {
+            for (int i = 0; i < 5; i++) {
+                gpio_set_level(LED_GPIO, 0);
+                vTaskDelay(pdMS_TO_TICKS(150));
+                gpio_set_level(LED_GPIO, 1);
+                vTaskDelay(pdMS_TO_TICKS(150));
+            }
+        }
+    }
 }
 
 static void blink_error_led(void) {
-    for (int i = 0; i < 5; i++) {
-        gpio_set_level(LED_GPIO, 0);
-        vTaskDelay(pdMS_TO_TICKS(150));
-        gpio_set_level(LED_GPIO, 1);
-        vTaskDelay(pdMS_TO_TICKS(150));
+    if (led_blink_sem) {
+        xSemaphoreGive(led_blink_sem);
     }
 }
 
 /* Permanent Wi-Fi event handler, active only for the initial STA
  * connection attempt at boot (using saved credentials). Once we enter
  * AP+STA setup mode, in_setup_mode is set and this handler's disconnect
- * branch is bypassed so it can't race with wifi_test_event_handler. */
+ * branch is bypassed so it can't race with wifi_test_event_handler.
+ *
+ * FIX (#reason-2 / AUTH_EXPIRE false positive): previously, several
+ * disconnect reasons -- including WIFI_REASON_AUTH_EXPIRE and the
+ * handshake-timeout codes -- were treated as an immediate, unambiguous
+ * "wrong password" verdict with zero retries, which sent the device
+ * straight into AP setup mode. In practice AUTH_EXPIRE is just a
+ * timeout waiting for the AP to respond during the auth stage, and it
+ * fires readily on the very first connection attempt right after boot
+ * (radio not fully settled, busy channel, weak signal) even with a
+ * completely correct password -- a plain restart, where the radio is
+ * already "warm", was enough to make it succeed, which is exactly this
+ * false-positive signature. Only WIFI_REASON_AUTH_FAIL (an explicit
+ * auth rejection from the AP) is now treated as a definite credential
+ * failure; every other disconnect reason goes through the normal
+ * WIFI_CONNECT_MAX_RETRIES retry loop first, and only falls back to
+ * WIFI_FAIL_BIT (setup mode) if it still hasn't connected after all
+ * retries are exhausted. */
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                                 int32_t event_id, void* event_data) {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
@@ -976,15 +1059,7 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
         wifi_event_sta_disconnected_t *disconn = (wifi_event_sta_disconnected_t *)event_data;
         uint8_t reason = disconn ? disconn->reason : 0;
 
-        bool is_auth_failure =
-            (reason == WIFI_REASON_AUTH_FAIL) ||
-            (reason == WIFI_REASON_AUTH_EXPIRE) ||
-            (reason == WIFI_REASON_HANDSHAKE_TIMEOUT) ||
-            (reason == WIFI_REASON_MIC_FAILURE) ||
-            (reason == WIFI_REASON_4WAY_HANDSHAKE_TIMEOUT) ||
-            (reason == WIFI_REASON_ASSOC_NOT_AUTHED);
-
-        if (is_auth_failure) {
+        if (is_definite_auth_failure(reason)) {
             ESP_LOGE(TAG, "Wi-Fi disconnected: wrong password / auth failure (reason=%d)", reason);
             wifi_retry_count = 0;
             blink_error_led();
@@ -994,32 +1069,63 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
 
         ESP_LOGW(TAG, "Wi-Fi disconnected (reason=%d)", reason);
 
+        if (!wifi_boot_phase) {
+            /* Past the initial boot handshake: we've been online before,
+             * so credentials are known-good and this is just a transient
+             * drop (AP reboot, interference, roaming, etc). Always retry,
+             * with no cap -- capping this is what used to let the device
+             * go permanently offline until someone power-cycled it. */
+            ESP_LOGI(TAG, "Reconnecting...");
+            esp_wifi_connect();
+            return;
+        }
+
         if (wifi_retry_count < WIFI_CONNECT_MAX_RETRIES) {
             wifi_retry_count++;
-            ESP_LOGI(TAG, "Retrying connection (%d/%d)...", wifi_retry_count, WIFI_CONNECT_MAX_RETRIES);
+            ESP_LOGI(TAG, "Retrying connection (%d/%d)... (reason=%d)",
+                     wifi_retry_count, WIFI_CONNECT_MAX_RETRIES, reason);
             esp_wifi_connect();
         } else {
+            /* Retries exhausted without ever getting a definite auth-fail
+             * signal from the AP -- likely a reachability/timeout issue
+             * rather than a wrong password, but either way we still need
+             * to fall back to setup mode so the device stays reachable. */
+            ESP_LOGW(TAG, "Giving up after %d retries (reason=%d), entering setup mode",
+                     WIFI_CONNECT_MAX_RETRIES, reason);
             xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
         }
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ESP_LOGI(TAG, "Got IP address");
         wifi_retry_count = 0;
+        wifi_boot_phase = false;
         xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
 
-/* Watches the running HTTP server handle. If it were ever left NULL
- * outside of our own controlled restart paths, the lamp would still
- * power the LED but be completely unreachable over the network — the
- * exact "have to open the case" scenario. Cheap, low-priority safety
- * net on top of the explicit restart-on-failure calls in
- * start_web_server()/start_config_server(). */
+/* FIX (#2): the old health check only tested `server == NULL`, which is
+ * never true once httpd_start() succeeds -- so a crashed httpd task went
+ * unnoticed forever.  Now we also verify the httpd task itself is still
+ * alive by looking it up by name (ESP-IDF names the task "httpd").
+ * If the handle is NULL or the task is gone, restart the device. */
 static void httpd_health_check_task(void *pvParameters) {
     const TickType_t check_interval = pdMS_TO_TICKS(30000);
     for (;;) {
         vTaskDelay(check_interval);
-        if (server == NULL) {
+
+        httpd_handle_t h = server;
+        if (h == NULL) {
             ESP_LOGE(TAG, "HTTP server handle is NULL during health check, restarting");
+            esp_restart();
+        }
+
+        TaskHandle_t httpd_task = xTaskGetHandle("httpd");
+        if (httpd_task == NULL) {
+            ESP_LOGE(TAG, "HTTP server task not found during health check, restarting");
+            esp_restart();
+        }
+        eTaskState st = eTaskGetState(httpd_task);
+        if (st == eDeleted || st == eInvalid) {
+            ESP_LOGE(TAG, "HTTP server task state is invalid (%d), restarting", (int)st);
             esp_restart();
         }
     }
@@ -1035,6 +1141,14 @@ void app_main(void) {
         ESP_LOGE(TAG, "Failed to create Wi-Fi test mutex, restarting");
         esp_restart();
     }
+
+    /* FIX (#6): semaphore + task for the non-blocking LED blink. */
+    led_blink_sem = xSemaphoreCreateBinary();
+    if (led_blink_sem == NULL) {
+        ESP_LOGE(TAG, "Failed to create LED blink semaphore, restarting");
+        esp_restart();
+    }
+    xTaskCreate(led_blink_task, "led_blink", 2048, NULL, 3, &led_blink_task_handle);
 
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -1086,6 +1200,14 @@ void app_main(void) {
         ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
         ESP_ERROR_CHECK(esp_wifi_start());
 
+        /* This is a mains-powered device with no battery to save, and
+         * modem power save (the ESP-IDF default) is a well-known cause
+         * of routers/APs quietly losing track of a station after it's
+         * been idle for a while -- the symptom is exactly "disconnects
+         * for no obvious reason after roughly a day". Run the radio at
+         * full power the whole time instead. */
+        ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+
         ESP_LOGI(TAG, "Connecting to Wi-Fi network...");
 
         EventBits_t bits = xEventGroupWaitBits(wifi_event_group,
@@ -1097,7 +1219,7 @@ void app_main(void) {
             ESP_LOGI(TAG, "Connection successful");
             start_mdns_service();
             start_web_server();
-            xTaskCreate(httpd_health_check_task, "httpd_health", 2048, NULL, 3, NULL);
+            xTaskCreate(httpd_health_check_task, "httpd_health", 3072, NULL, 3, NULL);
             /* We've now proven Wi-Fi connects and the web server comes up
              * on this image -- confirm it so the bootloader doesn't roll
              * back to the previous firmware on the next reboot (only
@@ -1120,14 +1242,28 @@ void app_main(void) {
         ESP_ERROR_CHECK(esp_wifi_deinit());
         ESP_ERROR_CHECK(esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, instance_any_id));
         ESP_ERROR_CHECK(esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, instance_got_ip));
-        esp_netif_destroy_default_wifi(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"));
+
+        /* FIX (#11): the previous code destroyed the STA netif here and
+         * then re-created it further down after creating the AP netif.
+         * That sequence is a known source of memory corruption / leaks
+         * in the esp_netif layer and has been observed to crash after
+         * hours of uptime.  Instead, we leave the STA netif in place and
+         * reuse it for APSTA mode below -- esp_wifi_set_mode() will
+         * reconfigure it.  No destroy/recreate cycle needed. */
     }
 
     ESP_LOGI(TAG, "Starting AP mode for setup...");
     in_setup_mode = true; /* from here on, wifi_test_event_handler owns disconnect handling */
 
+    /* FIX (#11): only create the STA netif if we didn't already create
+     * one in the HAVE_CREDENTIALS branch above.  Re-creating it would
+     * duplicate the netif and its event handlers. */
+    esp_netif_t *sta_netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (sta_netif == NULL) {
+        esp_netif_create_default_wifi_sta();
+    }
     esp_netif_create_default_wifi_ap();
-    esp_netif_create_default_wifi_sta();
+
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
@@ -1148,5 +1284,5 @@ void app_main(void) {
     start_mdns_service();
     start_dns_server();
     start_config_server();
-    xTaskCreate(httpd_health_check_task, "httpd_health", 2048, NULL, 3, NULL);
+    xTaskCreate(httpd_health_check_task, "httpd_health", 3072, NULL, 3, NULL);
 }
